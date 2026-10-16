@@ -1,0 +1,265 @@
+// labwork1.cpp : This file contains the 'main' function. Program execution begins and ends there.
+//
+
+#include<conio.h>
+#include<stdlib.h>
+#include <windows.h> //for Sleep function
+#include <stdio.h>
+#include <my_interaction_functions.h>
+
+extern "C" {
+#include <FreeRTOS.h>
+#include <task.h>
+#include <timers.h>
+#include <semphr.h>
+#include <interface.h>
+#include <interrupts.h>
+}
+
+#define mainREGION_1_SIZE 8201
+#define mainREGION_2_SIZE 29905
+#define mainREGION_3_SIZE 7607
+#define PULSE_TIMEOUT 800
+
+QueueHandle_t xQueueX = NULL;
+QueueHandle_t xQueueZ = NULL;
+
+SemaphoreHandle_t xPort2Mutex = NULL;
+
+xSemaphoreHandle sem_X_finished;
+xSemaphoreHandle sem_Z_finished;
+
+
+
+// ============================================================
+// ESTADO DOS BOTÕES E LUZES
+// ============================================================
+volatile int g_pulseUpper = 0;         // contagem de pulsos do switch 1
+volatile int g_pulseLower = 0;         // contagem de pulsos do switch 2
+volatile ULONGLONG g_lastUpperTime = 0;
+volatile ULONGLONG g_lastLowerTime = 0;
+volatile bool g_bothPressed = false;   // os dois premidos (futuro STOP)
+
+// Modos de luz: 0=OFF, 1=ON, 2=FLASH_SLOW, 3=FLASH_FAST
+volatile int g_lightUpperMode = 0;
+volatile int g_lightLowerMode = 0;
+
+extern "C"
+void vAssertCalled(unsigned long ulLine, const char* const pcFileName) {
+    printf("ASSERT! Line %ld, file %s\r\n", ulLine, pcFileName);
+    taskENTER_CRITICAL();
+    while (1);
+}
+
+static void initialiseHeap(void) {
+    static uint8_t ucHeap[configTOTAL_HEAP_SIZE];
+    volatile uint32_t ulAdditionalOffset = 19;
+    const HeapRegion_t xHeapRegions[] = {
+        { ucHeap + 1,                                              mainREGION_1_SIZE },
+        { ucHeap + 15 + mainREGION_1_SIZE,                          mainREGION_2_SIZE },
+        { ucHeap + 19 + mainREGION_1_SIZE + mainREGION_2_SIZE,      mainREGION_3_SIZE },
+        { NULL, 0 }
+    };
+    vPortDefineHeapRegions(xHeapRegions);
+}
+
+void vTaskMenu(void* pvParameters) {
+    int tecla = 0;
+    while (tecla != 27) {
+        if (_kbhit()) {
+            tecla = _getch();
+
+            // --- Movimentos directos (Y e stop) continuam imediatos ---
+            if (tecla == 's') { stopX(); stopY(); stopZ(); }
+            if (tecla == 'q') { printf("Y dentro\n");  moveYInside(); }
+            if (tecla == 'e') { printf("Y fora\n");    moveYOutside(); }
+            if (tecla == 'w') { printf("Z cima\n");    moveZUp(); }
+            if (tecla == 'x') { printf("Z baixo\n");   moveZDown(); }
+            if (tecla == 'a') { printf("X esquerda\n"); moveXLeft(); }
+            if (tecla == 'd') { printf("X direita\n"); moveXRight(); }
+
+            // --- Comandos gotoX: envia para a fila do X ---
+            if (tecla == '1') { int v = 1; xQueueSend(xQueueX, &v, 0); printf("pedido X=1\n"); }
+            if (tecla == '2') { int v = 2; xQueueSend(xQueueX, &v, 0); printf("pedido X=2\n"); }
+            if (tecla == '3') { int v = 3; xQueueSend(xQueueX, &v, 0); printf("pedido X=3\n"); }
+
+            // --- Comandos gotoZ: envia para a fila do Z ---
+            if (tecla == '7') { int v = 1; xQueueSend(xQueueZ, &v, 0); printf("pedido Z=1\n"); }
+            if (tecla == '8') { int v = 2; xQueueSend(xQueueZ, &v, 0); printf("pedido Z=2\n"); }
+            if (tecla == '9') { int v = 3; xQueueSend(xQueueZ, &v, 0); printf("pedido Z=3\n"); }
+
+            // --- GotoY (ainda directo, o Y não é paralelo) ---
+            if (tecla == '4') { printf("gotoY(1)\n"); gotoY(1); }
+            if (tecla == '5') { printf("gotoY(2)\n"); gotoY(2); }
+            if (tecla == '6') { printf("gotoY(3)\n"); gotoY(3); }
+
+            // --- Complexos (mantêm-se directos por agora) ---
+            if (tecla == 'u') { printf("gotoZUp\n");   gotoZUp(); }
+            if (tecla == 'z') { printf("gotoZDown\n"); gotoZDown(); }
+            if (tecla == 'p') { printf("putPartInCell\n");   putPartInCell(); }
+            if (tecla == 't') { printf("takePartFromCell\n"); takePartFromCell(); }
+
+            // --- Testar luzes manualmente ---
+            if (tecla == 'l') {  // 'L' = cycle upper light
+                g_lightUpperMode = (g_lightUpperMode + 1) % 4;
+                printf("Luz upper mode = %d\n", g_lightUpperMode);
+            }
+            if (tecla == 'k') {  // 'K' = cycle lower light
+                g_lightLowerMode = (g_lightLowerMode + 1) % 4;
+                printf("Luz lower mode = %d\n", g_lightLowerMode);
+            }
+        }
+        vTaskDelay(pdMS_TO_TICKS(20));
+    }
+    closeChannels();
+    exit(0);
+}
+
+
+// ============================================================
+// TASK HORIZONTAL — controla o eixo X
+// ============================================================
+void vTaskHorizontal(void* pvParameters) {
+    int target;
+    while (1) {
+        // Bloqueia até haver um pedido na fila
+        if (xQueueReceive(xQueueX, &target, portMAX_DELAY) == pdTRUE) {
+            // NF5: só move X se Y estiver no centro (posição 2)
+            if (getYPos() != 2) {
+                printf("[H] Y nao esta em 2, ignorado X=%d\n", target);
+                continue;
+            }
+            printf("[H] gotoX(%d)\n", target);
+            gotoX(target);
+        }
+    }
+}
+
+// ============================================================
+// TASK VERTICAL — controla o eixo Z
+// ============================================================
+void vTaskVertical(void* pvParameters) {
+    int target;
+    while (1) {
+        if (xQueueReceive(xQueueZ, &target, portMAX_DELAY) == pdTRUE) {
+            if (getYPos() != 2) {
+                printf("[V] Y nao esta em 2, ignorado Z=%d\n", target);
+                continue;
+            }
+            printf("[V] gotoZ(%d)\n", target);
+            gotoZ(target);
+        }
+    }
+}
+
+// ============================================================
+// TASK BOTÕES — deteção de flanco + contagem de pulsos
+// ============================================================
+
+
+// ============================================================
+// TASK LIGHTS — controla as duas luzes conforme os modos globais
+// ============================================================
+void vTaskLights(void* pvParameters) {
+    bool upperOn = false;
+    bool lowerOn = false;
+    ULONGLONG lastToggle = 0;
+
+    while (1) {
+        ULONGLONG now = GetTickCount64();
+        ULONGLONG elapsed = now - lastToggle;
+
+        // Determinar se é altura de "tick" (inverter estado)
+        bool tick = false;
+        ULONGLONG period = 1000; // por defeito, 1 segundo
+
+        // Se alguma luz está em modo rápido, o período é mais curto
+        if (g_lightUpperMode == 3 || g_lightLowerMode == 3) {
+            period = 100;      // 100ms = 5 Hz
+        }
+        else if (g_lightUpperMode == 2 || g_lightLowerMode == 2) {
+            period = 400;      // 400ms = 1.25 Hz
+        }
+
+        if (elapsed >= period) {
+            tick = true;
+            lastToggle = now;
+        }
+
+        // ---- Atualizar upper ----
+        switch (g_lightUpperMode) {
+        case 0: upperOn = false; break;                        // OFF
+        case 1: upperOn = true;  break;                        // ON
+        case 2:                                                // FLASH SLOW
+        case 3: if (tick) upperOn = !upperOn; break;           // FLASH
+        }
+
+        // ---- Atualizar lower ----
+        switch (g_lightLowerMode) {
+        case 0: lowerOn = false; break;
+        case 1: lowerOn = true;  break;
+        case 2:
+        case 3: if (tick) lowerOn = !lowerOn; break;
+        }
+
+        // ---- Escrever no port 2 ----
+        uInt8 p = readDigitalU8(2);
+        setBitValue(&p, 0, upperOn ? 1 : 0);
+        setBitValue(&p, 1, lowerOn ? 1 : 0);
+        writeDigitalU8(2, p);
+
+        vTaskDelay(pdMS_TO_TICKS(20));
+    }
+}
+
+void myDaemonTaskStartupHook(void) {
+    // INPUT PORTS
+    createDigitalInput(0);
+    createDigitalInput(1);
+    // OUTPUT PORTS
+    createDigitalOutput(2);
+
+    printf("\nCalibra o kit manualmente e prime ENTER...");
+    while (true) {
+        if (_kbhit() && _getch() == 13) break; // 13 = Enter
+    }
+    printf("\nA iniciar tarefas...\n");
+
+    // Criar filas de pedidos de movimento
+    xQueueX = xQueueCreate(5, sizeof(int));
+    xQueueZ = xQueueCreate(5, sizeof(int));
+
+    // Criar mutex do port 2 (por agora não usado, mas fica pronto)
+    xPort2Mutex = xSemaphoreCreateMutex();
+
+    // Criar tarefas: nome, stack, param, prioridade, handle
+    xTaskCreate(vTaskMenu, "Menu", 1000, NULL, 2, NULL);
+    xTaskCreate(vTaskHorizontal, "Horizontal", 1000, NULL, 2, NULL);
+    xTaskCreate(vTaskVertical, "Vertical", 1000, NULL, 2, NULL);
+    xTaskCreate(vTaskButtons, "Buttons", 1000, NULL, 2, NULL);
+    xTaskCreate(vTaskLights, "Lights", 500, NULL, 1, NULL);
+
+    attachInterrupt(1, 5, switch1_rising_isr, RISING);
+    attachInterrupt(1, 6, switch2_rising_isr, RISING);
+	attachInterrupt(1, 5, switch1_falling_isr, FALLING);
+}
+
+int main() {
+    initialiseHeap();
+    vApplicationDaemonTaskStartupHook = &myDaemonTaskStartupHook;
+    vTaskStartScheduler();
+
+    // Nunca deve chegar aqui
+    while (1);
+    return 0;
+}
+// Run program: Ctrl + F5 or Debug > Start Without Debugging menu
+// Debug program: F5 or Debug > Start Debugging menu
+
+// Tips for Getting Started: 
+//   1. Use the Solution Explorer window to add/manage files
+//   2. Use the Team Explorer window to connect to source control
+//   3. Use the Output window to see build output and other messages
+//   4. Use the Error List window to view errors
+//   5. Go to Project > Add New Item to create new code files, or Project > Add Existing Item to add existing code files to the project
+//   6. In the future, to open this project again, go to File > Open > Project and select the .sln file
