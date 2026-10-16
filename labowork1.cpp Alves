@@ -44,6 +44,71 @@ typedef struct {
 QueueHandle_t     mbx_XZ = NULL;
 
 // ============================================================
+// INVENTÁRIO E ESTRUTURAS DE ALTO NÍVEL
+// ============================================================
+#define NUM_CELLS_X     3
+#define NUM_CELLS_Z     3
+#define MAX_COMPONENTS  9
+
+typedef struct {
+    int       id;           // 1..9
+    int       family;       // 1..3
+    int       cellX;        // 1..3
+    int       cellZ;        // 1..3
+    bool      active;       // está armazenado?
+    bool      inTransit;    // está a ser movimentado?
+    ULONGLONG storageTime;  // timestamp de conclusão do armazenamento
+} Component;
+
+// Inventário global (índice 1..9)
+Component g_inventory[10];
+
+// Fila de pedidos de alto nível
+typedef enum { REQ_STORE, REQ_DISPENSE } RequestType;
+typedef struct {
+    RequestType type;
+    int         value;   // ID para STORE, family para DISPENSE
+} Request;
+
+QueueHandle_t     xRequestQueue = NULL;
+SemaphoreHandle_t sem_XZ_finished = NULL;
+SemaphoreHandle_t xInventoryMutex = NULL;
+SemaphoreHandle_t xXZBusyMutex = NULL;
+
+// ============================================================
+// FUNÇÕES AUXILIARES
+// ============================================================
+int getFamily(int id) {
+    if (id == 1 || id == 4 || id == 7) return 1;
+    if (id == 2 || id == 5 || id == 8) return 2;
+    if (id == 3 || id == 6 || id == 9) return 3;
+    return 0;
+}
+
+int findComponentInCell(int x, int z) {
+    for (int i = 1; i <= MAX_COMPONENTS; i++) {
+        if (g_inventory[i].active &&
+            g_inventory[i].cellX == x &&
+            g_inventory[i].cellZ == z)
+            return i;
+    }
+    return -1;
+}
+
+bool findEmptyCell(int* outX, int* outZ) {
+    for (int z = 1; z <= NUM_CELLS_Z; z++) {
+        for (int x = 1; x <= NUM_CELLS_X; x++) {
+            if (findComponentInCell(x, z) == -1) {
+                *outX = x;
+                *outZ = z;
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+// ============================================================
 // ESTADO DOS BOTÕES E LUZES
 // ============================================================
 volatile int       g_pulseUpper = 0;
@@ -140,13 +205,13 @@ void vTaskMenu(void* pvParameters) {
             if (tecla == 'a') { printf("X esquerda\n"); moveXLeft(); }
             if (tecla == 'd') { printf("X direita\n"); moveXRight(); }
 
-            if (tecla == '1') { int v = 1; xQueueSend(xQueueX, &v, 0); printf("pedido X=1\n"); }
-            if (tecla == '2') { int v = 2; xQueueSend(xQueueX, &v, 0); printf("pedido X=2\n"); }
-            if (tecla == '3') { int v = 3; xQueueSend(xQueueX, &v, 0); printf("pedido X=3\n"); }
+           // if (tecla == '1') { int v = 1; xQueueSend(xQueueX, &v, 0); printf("pedido X=1\n"); }
+           // if (tecla == '2') { int v = 2; xQueueSend(xQueueX, &v, 0); printf("pedido X=2\n"); }
+           // if (tecla == '3') { int v = 3; xQueueSend(xQueueX, &v, 0); printf("pedido X=3\n"); }
 
-            if (tecla == '7') { int v = 1; xQueueSend(xQueueZ, &v, 0); printf("pedido Z=1\n"); }
-            if (tecla == '8') { int v = 2; xQueueSend(xQueueZ, &v, 0); printf("pedido Z=2\n"); }
-            if (tecla == '9') { int v = 3; xQueueSend(xQueueZ, &v, 0); printf("pedido Z=3\n"); }
+           // if (tecla == '7') { int v = 1; xQueueSend(xQueueZ, &v, 0); printf("pedido Z=1\n"); }
+           // if (tecla == '8') { int v = 2; xQueueSend(xQueueZ, &v, 0); printf("pedido Z=2\n"); }
+           // if (tecla == '9') { int v = 3; xQueueSend(xQueueZ, &v, 0); printf("pedido Z=3\n"); }
 
             if (tecla == '4') { printf("gotoY(1)\n"); gotoY(1); }
             if (tecla == '5') { printf("gotoY(2)\n"); gotoY(2); }
@@ -243,6 +308,8 @@ void goto_XZ_task(void* pvParameters) {
         if (xQueueReceive(mbx_XZ, &c, portMAX_DELAY) == pdTRUE) {
             printf("[XZ] goto (%d,%d)\n", c.x, c.z);
 
+			xSemaphoreTake(xXZBusyMutex, portMAX_DELAY);    
+
             xQueueSend(xQueueX, &c.x, portMAX_DELAY);
             xQueueSend(xQueueZ, &c.z, portMAX_DELAY);
 
@@ -250,6 +317,76 @@ void goto_XZ_task(void* pvParameters) {
             xSemaphoreTake(sem_Z_finished, portMAX_DELAY);
 
             printf("[XZ] done (%d,%d)\n", c.x, c.z);
+			xSemaphoreGive(xXZBusyMutex);
+            xSemaphoreGive(sem_XZ_finished);
+        }
+    }
+}
+
+// ============================================================
+// TASK STORE — executa pedidos de armazenamento (FR3)
+// ============================================================
+void vTaskStore(void* pvParameters) {
+    Request req;
+    while (1) {
+        if (xQueueReceive(xRequestQueue, &req, portMAX_DELAY) == pdTRUE) {
+            if (req.type != REQ_STORE) continue;
+
+            int id = req.value;
+
+            // --- Validação ---
+            if (id < 1 || id > 9) {
+                printf("[STORE] ID invalido: %d\n", id);
+                continue;
+            }
+
+            xSemaphoreTake(xInventoryMutex, portMAX_DELAY);
+
+            if (g_inventory[id].active || g_inventory[id].inTransit) {
+                printf("[STORE] ID %d ja armazenado ou em transito. Rejeitado.\n", id);
+                xSemaphoreGive(xInventoryMutex);
+                continue;
+            }
+
+            int cellX, cellZ;
+            if (!findEmptyCell(&cellX, &cellZ)) {
+                printf("[STORE] Armazem cheio. Rejeitado.\n");
+                xSemaphoreGive(xInventoryMutex);
+                continue;
+            }
+
+            // Reserva a célula (inTransit = true impede dupla reserva)
+            g_inventory[id].inTransit = true;
+            g_inventory[id].cellX = cellX;
+            g_inventory[id].cellZ = cellZ;
+            g_inventory[id].family = getFamily(id);
+            xSemaphoreGive(xInventoryMutex);
+
+            printf("[STORE] ID=%d Family=%d Cell=(%d,%d)\n",
+                id, getFamily(id), cellX, cellZ);
+
+            // FR8: luz superior pisca durante o armazenamento
+            g_lightUpperMode = 2;
+
+            // Pede à mediation task para mover (X,Z)
+            Coords c = { cellX, cellZ };
+            xQueueSend(mbx_XZ, &c, portMAX_DELAY);
+            xSemaphoreTake(sem_XZ_finished, portMAX_DELAY);
+
+            // Coloca a peça na célula
+            putPartInCell();
+
+            // Regista conclusão
+            ULONGLONG now = GetTickCount64();
+            xSemaphoreTake(xInventoryMutex, portMAX_DELAY);
+            g_inventory[id].active = true;
+            g_inventory[id].inTransit = false;
+            g_inventory[id].storageTime = now;
+            xSemaphoreGive(xInventoryMutex);
+
+            printf("[STORE] Concluido: ID=%d Time=%llu ms\n", id, now);
+
+            g_lightUpperMode = 0;
         }
     }
 }
@@ -264,15 +401,22 @@ void vTaskButtonReporter(void* pvParameters) {
         if (g_pulseUpper > 0 && (now - g_lastUpperTime) > PULSE_TIMEOUT_MS) {
             int id = g_pulseUpper;
             g_pulseUpper = 0;
-            printf("[BTN] Upper sequence complete: ID=%d\n", id);
-            // TODO (Fase 4.4): enviar REQ_STORE(id)
+
+            if (id >= 1 && id <= 9) {
+                Request r = { REQ_STORE, id };
+                xQueueSend(xRequestQueue, &r, 0);
+                printf("[BTN] Store request ID=%d enviado\n", id);
+            }
+            else {
+                printf("[BTN] ID invalido (%d) — ignorado\n", id);
+            }
         }
 
         if (g_pulseLower > 0 && (now - g_lastLowerTime) > PULSE_TIMEOUT_MS) {
             int fam = g_pulseLower;
             g_pulseLower = 0;
-            printf("[BTN] Lower sequence complete: family=%d\n", fam);
             // TODO (Fase 4.5): enviar REQ_DISPENSE(fam)
+            printf("[BTN] Lower sequence complete: family=%d\n", fam);
         }
 
         uInt8 p1 = readDigitalU8(1);
@@ -352,11 +496,27 @@ void myDaemonTaskStartupHook(void) {
     xQueueX = xQueueCreate(5, sizeof(int));
     xQueueZ = xQueueCreate(5, sizeof(int));
     mbx_XZ = xQueueCreate(5, sizeof(Coords));
+    xRequestQueue = xQueueCreate(10, sizeof(Request));
+    xXZBusyMutex = xSemaphoreCreateMutex();
     
 
     // Semáforos de conclusão de movimento
     sem_X_finished = xSemaphoreCreateCounting(10, 0);
     sem_Z_finished = xSemaphoreCreateCounting(10, 0);
+    sem_XZ_finished = xSemaphoreCreateCounting(10, 0);
+    xInventoryMutex = xSemaphoreCreateMutex();
+
+    // Inicializar inventário
+    for (int i = 0; i <= MAX_COMPONENTS; i++) {
+        g_inventory[i].id = i;
+        g_inventory[i].family = getFamily(i);
+        g_inventory[i].cellX = 0;
+        g_inventory[i].cellZ = 0;
+        g_inventory[i].active = false;
+        g_inventory[i].inTransit = false;
+        g_inventory[i].storageTime = 0;
+    }
+    printf("Inventario inicializado.\n");
 
     // Criar tarefas
     xTaskCreate(vTaskMenu, "Menu", 1000, NULL, 2, NULL);
@@ -365,6 +525,7 @@ void myDaemonTaskStartupHook(void) {
     xTaskCreate(vTaskButtonReporter, "BtnReporter", 1000, NULL, 2, NULL);
     xTaskCreate(vTaskLights, "Lights", 500, NULL, 1, NULL);
     xTaskCreate(goto_XZ_task, "GOTO XZ Task", 1000, NULL, 3, NULL);
+    xTaskCreate(vTaskStore, "Store", 1000, NULL, 3, NULL);
 
     //xTaskCreate(vTaskEmergency, "Emergency", 500, NULL, 2, &emergencyTask);
     //xTaskCreate(vTaskResume,    "Resume",    500, NULL, 2, &resumeTask);
