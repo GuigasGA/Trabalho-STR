@@ -25,7 +25,7 @@ QueueHandle_t xQueueX = NULL;
 QueueHandle_t xQueueZ = NULL;
 
 SemaphoreHandle_t xPort2Mutex = NULL;
-aaa
+
 xSemaphoreHandle sem_X_finished;
 xSemaphoreHandle sem_Z_finished;
 
