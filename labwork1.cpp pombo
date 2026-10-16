@@ -20,10 +20,19 @@ extern "C" {
 #define mainREGION_2_SIZE 29905
 #define mainREGION_3_SIZE 7607
 
+
+typedef struct {
+    int x;
+    int z;
+} CellCoord;
+
+QueueHandle_t xQueueXZ = NULL;
 QueueHandle_t xQueueX = NULL;
 QueueHandle_t xQueueZ = NULL;
 
 SemaphoreHandle_t xPort2Mutex = NULL;
+xSemaphoreHandle sem_X_finished = NULL;
+xSemaphoreHandle sem_Z_finished = NULL;
 
 
 // ============================================================
@@ -74,14 +83,28 @@ void vTaskMenu(void* pvParameters) {
             if (tecla == 'd') { printf("X direita\n"); moveXRight(); }
 
             // --- Comandos gotoX: envia para a fila do X ---
-            if (tecla == '1') { int v = 1; xQueueSend(xQueueX, &v, 0); printf("pedido X=1\n"); }
-            if (tecla == '2') { int v = 2; xQueueSend(xQueueX, &v, 0); printf("pedido X=2\n"); }
-            if (tecla == '3') { int v = 3; xQueueSend(xQueueX, &v, 0); printf("pedido X=3\n"); }
+            //if (tecla == '1') { int v = 1; xQueueSend(xQueueX, &v, 0); printf("pedido X=1\n"); }
+            //if (tecla == '2') { int v = 2; xQueueSend(xQueueX, &v, 0); printf("pedido X=2\n"); }
+            //if (tecla == '3') { int v = 3; xQueueSend(xQueueX, &v, 0); printf("pedido X=3\n"); }
 
             // --- Comandos gotoZ: envia para a fila do Z ---
-            if (tecla == '7') { int v = 1; xQueueSend(xQueueZ, &v, 0); printf("pedido Z=1\n"); }
-            if (tecla == '8') { int v = 2; xQueueSend(xQueueZ, &v, 0); printf("pedido Z=2\n"); }
-            if (tecla == '9') { int v = 3; xQueueSend(xQueueZ, &v, 0); printf("pedido Z=3\n"); }
+            //if (tecla == '7') { int v = 1; xQueueSend(xQueueZ, &v, 0); printf("pedido Z=1\n"); }
+            //if (tecla == '8') { int v = 2; xQueueSend(xQueueZ, &v, 0); printf("pedido Z=2\n"); }
+            //if (tecla == '9') { int v = 3; xQueueSend(xQueueZ, &v, 0); printf("pedido Z=3\n"); }
+			// gotoXZ: envia para a fila do XZ (paralelo)
+            if (tecla == 'm') {
+                int x_target = _getch() - '0';
+                int z_target = _getch() - '0';
+
+                if (x_target >= 1 && x_target <= 3 && z_target >= 1 && z_target <= 3) {
+                    printf("Deslocacao para X=%d, Z=%d\n", x_target, z_target);
+                    CellCoord coord = { x_target, z_target };
+                    xQueueSend(xQueueXZ, &coord, 0);
+                }
+                else {
+                    printf("Coordenadas invalidas!\n");
+                }
+            }
 
             // --- GotoY (ainda directo, o Y não é paralelo) ---
             if (tecla == '4') { printf("gotoY(1)\n"); gotoY(1); }
@@ -133,6 +156,7 @@ void vTaskHorizontal(void* pvParameters) {
             }
             printf("[H] gotoX(%d)\n", target);
             gotoX(target);
+			xSemaphoreGive(sem_X_finished); //X chegou ao destino, sinaliza que terminou
         }
     }
 }
@@ -150,6 +174,24 @@ void vTaskVertical(void* pvParameters) {
             }
             printf("[V] gotoZ(%d)\n", target);
             gotoZ(target);
+			xSemaphoreGive(sem_Z_finished); //Z chegou ao destino, sinaliza que terminou
+        }
+    }
+}
+
+// ============================================================
+// TASK SIMULTÂNEA - controla X e Z em paralelo
+// ============================================================
+
+void vTaskGotoXZ(void* pvParameters) {
+    CellCoord target;
+    while (1) {
+        if (xQueueReceive(xQueueXZ, &target, portMAX_DELAY) == pdTRUE) {
+            xQueueSend(xQueueX, &target.x, portMAX_DELAY);
+            xQueueSend(xQueueZ, &target.z, portMAX_DELAY);
+
+            xSemaphoreTake(sem_X_finished, portMAX_DELAY);
+            xSemaphoreTake(sem_Z_finished, portMAX_DELAY);
         }
     }
 }
@@ -262,14 +304,18 @@ void myDaemonTaskStartupHook(void) {
     // Criar filas de pedidos de movimento
     xQueueX = xQueueCreate(5, sizeof(int));
     xQueueZ = xQueueCreate(5, sizeof(int));
-
+    xQueueXZ = xQueueCreate(5, sizeof(CellCoord));
     // Criar mutex do port 2 (por agora não usado, mas fica pronto)
     xPort2Mutex = xSemaphoreCreateMutex();
+
+    sem_X_finished = xSemaphoreCreateCounting(1, 0);
+    sem_Z_finished = xSemaphoreCreateCounting(1, 0);
 
     // Criar tarefas: nome, stack, param, prioridade, handle
     xTaskCreate(vTaskMenu, "Menu", 1000, NULL, 2, NULL);
     xTaskCreate(vTaskHorizontal, "Horizontal", 1000, NULL, 2, NULL);
     xTaskCreate(vTaskVertical, "Vertical", 1000, NULL, 2, NULL);
+    xTaskCreate(vTaskGotoXZ, "GotoXZ", 1000, NULL, 2, NULL);
     xTaskCreate(vTaskButtons, "Buttons", 1000, NULL, 2, NULL);
     xTaskCreate(vTaskLights, "Lights", 500, NULL, 1, NULL);
 }
