@@ -150,6 +150,26 @@ bool findEmptyCell(int* outX, int* outZ) {
 }
 
 // ============================================================
+// TASK STARTUP CALIBRATION — espera pelo simulador e calibra
+// ============================================================
+void vTaskStartupCalibration(void* pvParameters) {
+    vTaskDelay(pdMS_TO_TICKS(2000));   // dá tempo ao mongoose/simulador
+    semiCalibration();
+    vTaskDelete(NULL);                  // termina (one-shot)
+}
+
+// ============================================================
+// Format ULONGLONG ms -> "HH:MM:SS.mmm" (relativo ao arranque do Windows)
+// ============================================================
+void formatTime(ULONGLONG ms, char* buf, int bufSize) {
+    ULONGLONG totalSec = ms / 1000;
+    ULONGLONG milli = ms % 1000;
+    int h = (int)(totalSec / 3600);
+    int m = (int)((totalSec / 60) % 60);
+    int s = (int)(totalSec % 60);
+    snprintf(buf, bufSize, "%02d:%02d:%02d.%03llu", h, m, s, milli);
+}
+// ============================================================
 // ESTADO DOS BOTÕES E LUZES
 // ============================================================
 volatile int       g_pulseUpper = 0;
@@ -234,6 +254,12 @@ void vTaskResume(void* pvParameters) {
 // ============================================================
 void vTaskMenu(void* pvParameters) {
     int tecla = 0;
+    printf("\n=== MENU ===\n");
+    printf("Movimentos: 4/5/6 (Y) | g (goto XZ) | p/t (put/take) | u/z (Z up/down)\n");
+    printf("Luzes: l (upper) | k (lower) | s (stop all)\n");
+    printf("Info:  i (inventario) | f (familia) | v (celula) | h (historico) | n (contadores)\n");
+    printf("Outros: c (calibrar) | ESC (sair)\n");
+    printf("============\n");
     while (tecla != 27) {
         if (_kbhit()) {
             tecla = _getch();
@@ -297,6 +323,139 @@ void vTaskMenu(void* pvParameters) {
             if (tecla == 'c') {
                 printf("Calibracao semi-automatica pedida\n");
                 semiCalibration();
+            }
+            // ============================================================
+// FR11 — Lista de componentes armazenados
+// ============================================================
+            if (tecla == 'i') {
+                xSemaphoreTake(xInventoryMutex, portMAX_DELAY);
+                printf("\n--- FR11: Inventario ---\n");
+                printf("%-3s %-6s %-8s %-14s %-12s\n",
+                    "ID", "Fam", "Cell", "StorageTime", "Elapsed");
+                bool any = false;
+                ULONGLONG now = GetTickCount64();
+                for (int id = 1; id <= MAX_COMPONENTS; id++) {
+                    if (!g_inventory[id].active) continue;
+                    any = true;
+                    char ts[32], el[32];
+                    formatTime(g_inventory[id].storageTime, ts, sizeof(ts));
+                    formatTime(now - g_inventory[id].storageTime, el, sizeof(el));
+                    printf("%-3d %-6d (%d,%d)   %-14s %-12s\n",
+                        id,
+                        g_inventory[id].family,
+                        g_inventory[id].cellX,
+                        g_inventory[id].cellZ,
+                        ts, el);
+                }
+                if (!any) printf("(vazio)\n");
+                xSemaphoreGive(xInventoryMutex);
+            }
+
+            // ============================================================
+            // FR12 — Stock + próximo FIFO para uma família
+            // ============================================================
+            if (tecla == 'f') {
+                printf("Familia (1-3): ");
+                int fam = 0;
+                while (!_kbhit()) vTaskDelay(pdMS_TO_TICKS(20));
+                fam = _getch() - '0';
+                printf("%d\n", fam);
+
+                if (fam < 1 || fam > 3) {
+                    printf("Familia invalida\n");
+                }
+                else {
+                    xSemaphoreTake(xInventoryMutex, portMAX_DELAY);
+                    printf("\n--- FR12: Familia %d ---\n", fam);
+                    printf("Disponiveis: %d\n", g_fifoCount[fam]);
+                    if (g_fifoCount[fam] > 0) {
+                        int nid = g_fifo[fam][0];
+                        char ts[32];
+                        formatTime(g_inventory[nid].storageTime, ts, sizeof(ts));
+                        printf("Proximo FIFO: ID=%d Cell=(%d,%d) StorageTime=%s\n",
+                            nid,
+                            g_inventory[nid].cellX,
+                            g_inventory[nid].cellZ,
+                            ts);
+                    }
+                    else {
+                        printf("Out of stock.\n");
+                    }
+                    xSemaphoreGive(xInventoryMutex);
+                }
+            }
+
+            // ============================================================
+            // FR13 — Consultar uma célula
+            // ============================================================
+            if (tecla == 'v') {
+                printf("X (1-3): ");
+                while (!_kbhit()) vTaskDelay(pdMS_TO_TICKS(20));
+                int qx = _getch() - '0';
+                printf("%d\nZ (1-3): ", qx);
+                while (!_kbhit()) vTaskDelay(pdMS_TO_TICKS(20));
+                int qz = _getch() - '0';
+                printf("%d\n", qz);
+
+                if (qx < 1 || qx > 3 || qz < 1 || qz > 3) {
+                    printf("Celula invalida\n");
+                }
+                else {
+                    xSemaphoreTake(xInventoryMutex, portMAX_DELAY);
+                    printf("\n--- FR13: Celula (%d,%d) ---\n", qx, qz);
+                    int id = findComponentInCell(qx, qz);
+                    if (id == -1) {
+                        printf("Celula vazia.\n");
+                    }
+                    else {
+                        char ts[32], el[32];
+                        ULONGLONG now = GetTickCount64();
+                        formatTime(g_inventory[id].storageTime, ts, sizeof(ts));
+                        formatTime(now - g_inventory[id].storageTime, el, sizeof(el));
+                        printf("ID=%d Family=%d StorageTime=%s Elapsed=%s\n",
+                            id, g_inventory[id].family, ts, el);
+                    }
+                    xSemaphoreGive(xInventoryMutex);
+                }
+            }
+
+            // ============================================================
+            // FR14 — Histórico de dispensações concluídas
+            // ============================================================
+            if (tecla == 'h') {
+                xSemaphoreTake(xInventoryMutex, portMAX_DELAY);
+                printf("\n--- FR14: Historico de dispensacoes ---\n");
+                if (g_historyCount == 0) {
+                    printf("(vazio)\n");
+                }
+                else {
+                    printf("%-3s %-4s %-6s %-14s %-12s\n",
+                        "#", "ID", "Fam", "DispenseTime", "Duracao");
+                    for (int i = 0; i < g_historyCount; i++) {
+                        char dt[32], du[32];
+                        formatTime(g_history[i].dispenseTime, dt, sizeof(dt));
+                        formatTime(g_history[i].storageDuration, du, sizeof(du));
+                        printf("%-3d %-4d %-6d %-14s %-12s\n",
+                            i + 1,
+                            g_history[i].id,
+                            g_history[i].family,
+                            dt, du);
+                    }
+                }
+                xSemaphoreGive(xInventoryMutex);
+            }
+
+            // ============================================================
+            // FR15 — Contadores por familia + total
+            // ============================================================
+            if (tecla == 'n') {
+                xSemaphoreTake(xInventoryMutex, portMAX_DELAY);
+                printf("\n--- FR15: Contadores ---\n");
+                for (int fam = 1; fam <= 3; fam++) {
+                    printf("Familia %d: %d servicos concluidos\n", fam, g_familyCount[fam]);
+                }
+                printf("Total: %d\n", g_totalCount);
+                xSemaphoreGive(xInventoryMutex);
             }
         }
         vTaskDelay(pdMS_TO_TICKS(20));
@@ -681,7 +840,7 @@ void myDaemonTaskStartupHook(void) {
     attachInterrupt(1, 6, switch2_rising_isr, RISING);
 
     // Calibração semi-automática no arranque
-    semiCalibration();
+    xTaskCreate(vTaskStartupCalibration, "StartupCalib", 1000, NULL, 4, NULL);
     printf("Sistema pronto. Aguardando comandos...\n");
 }
 
