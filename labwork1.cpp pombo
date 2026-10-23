@@ -1,9 +1,9 @@
 // labwork1.cpp : This file contains the 'main' function. Program execution begins and ends there.
 //
 
-#include<conio.h>
-#include<stdlib.h>
-#include <windows.h> //for Sleep function
+#include <conio.h>
+#include <stdlib.h>
+#include <windows.h>
 #include <stdio.h>
 #include <my_interaction_functions.h>
 
@@ -19,35 +19,140 @@ extern "C" {
 #define mainREGION_1_SIZE 8201
 #define mainREGION_2_SIZE 29905
 #define mainREGION_3_SIZE 7607
+#define PULSE_TIMEOUT_MS 800
 
+// Forward declarations
+void semiCalibration();
 
+// ============================================================
+// HANDLES GLOBAIS
+// ============================================================
+xQueueHandle xQueueX = NULL;
+xQueueHandle xQueueZ = NULL;
+
+SemaphoreHandle_t sem_X_finished = NULL;
+SemaphoreHandle_t sem_Z_finished = NULL;
+
+// ============================================================
+// CONTROLO DE EMERGÊNCIA (FR5)
+// ============================================================
+volatile bool emergencyStop = false;
+
+xTaskHandle hTaskStore = NULL;
+xTaskHandle hTaskDispense = NULL; // Handle adicionado para controlar a tarefa Dispense no STOP/RESUME
+xTaskHandle hTaskGotoXZ = NULL;
+xTaskHandle hTaskHorizontal = NULL;
+xTaskHandle hTaskVertical = NULL;
+
+// Mailbox e semáforo para a mediation task
 typedef struct {
     int x;
     int z;
-} CellCoord;
+} Coords;
 
-QueueHandle_t xQueueXZ = NULL;
-QueueHandle_t xQueueX = NULL;
-QueueHandle_t xQueueZ = NULL;
+QueueHandle_t     mbx_XZ = NULL;
 
-SemaphoreHandle_t xPort2Mutex = NULL;
-xSemaphoreHandle sem_X_finished = NULL;
-xSemaphoreHandle sem_Z_finished = NULL;
+// ============================================================
+// INVENTÁRIO E ESTRUTURAS DE ALTO NÍVEL
+// ============================================================
+#define NUM_CELLS_X     3
+#define NUM_CELLS_Z     3
+#define MAX_COMPONENTS  9
 
+typedef struct {
+    int       id;           // 1..9
+    int       family;       // 1..3
+    int       cellX;        // 1..3
+    int       cellZ;        // 1..3
+    bool      active;       // está armazenado?
+    bool      inTransit;    // está a ser movimentado?
+    ULONGLONG storageTime;  // timestamp de conclusão do armazenamento
+} Component;
+
+// Inventário global (índice 1..9)
+Component g_inventory[10];
+
+// Fila de pedidos de alto nível (dividida em xStoreQueue e xDispenseQueue)
+typedef enum { REQ_STORE, REQ_DISPENSE } RequestType;
+typedef struct {
+    RequestType type;
+    int         value;   // ID para STORE, family para DISPENSE
+} Request;
+
+QueueHandle_t     xStoreQueue = NULL;    // Substitui a xRequestQueue
+QueueHandle_t     xDispenseQueue = NULL; // Fila dedicada a pedidos de dispensa
+SemaphoreHandle_t sem_XZ_finished = NULL;
+SemaphoreHandle_t xInventoryMutex = NULL;
+SemaphoreHandle_t xXZBusyMutex = NULL;
+
+// ============================================================
+// FIFO POR FAMÍLIA E HISTÓRICO (FR4, FR14, FR15)
+// ============================================================
+int g_fifo[4][MAX_COMPONENTS];
+int g_fifoCount[4] = { 0 };
+
+typedef struct {
+    int       id;
+    int       family;
+    ULONGLONG dispenseTime;
+    ULONGLONG storageDuration;
+} DispenseRecord;
+
+DispenseRecord g_history[100];
+int g_historyCount = 0;
+
+int g_familyCount[4] = { 0 };
+int g_totalCount = 0;
+
+// ============================================================
+// FUNÇÕES AUXILIARES
+// ============================================================
+int getFamily(int id) {
+    if (id == 1 || id == 4 || id == 7) return 1;
+    if (id == 2 || id == 5 || id == 8) return 2;
+    if (id == 3 || id == 6 || id == 9) return 3;
+    return 0;
+}
+
+int findComponentInCell(int x, int z) {
+    for (int i = 1; i <= MAX_COMPONENTS; i++) {
+        if (g_inventory[i].active &&
+            g_inventory[i].cellX == x &&
+            g_inventory[i].cellZ == z)
+            return i;
+    }
+    return -1;
+}
+
+bool findEmptyCell(int* outX, int* outZ) {
+    for (int z = 1; z <= NUM_CELLS_Z; z++) {
+        for (int x = 1; x <= NUM_CELLS_X; x++) {
+            if (findComponentInCell(x, z) == -1) {
+                *outX = x;
+                *outZ = z;
+                return true;
+            }
+        }
+    }
+    return false;
+}
 
 // ============================================================
 // ESTADO DOS BOTÕES E LUZES
 // ============================================================
-volatile int g_pulseUpper = 0;         // contagem de pulsos do switch 1
-volatile int g_pulseLower = 0;         // contagem de pulsos do switch 2
+volatile int       g_pulseUpper = 0;
+volatile int       g_pulseLower = 0;
 volatile ULONGLONG g_lastUpperTime = 0;
 volatile ULONGLONG g_lastLowerTime = 0;
-volatile bool g_bothPressed = false;   // os dois premidos (futuro STOP)
+volatile bool      g_bothPressed = false;
 
 // Modos de luz: 0=OFF, 1=ON, 2=FLASH_SLOW, 3=FLASH_FAST
 volatile int g_lightUpperMode = 0;
 volatile int g_lightLowerMode = 0;
 
+// ============================================================
+// OBRIGATÓRIO para o FreeRTOS
+// ============================================================
 extern "C"
 void vAssertCalled(unsigned long ulLine, const char* const pcFileName) {
     printf("ASSERT! Line %ld, file %s\r\n", ulLine, pcFileName);
@@ -67,13 +172,186 @@ static void initialiseHeap(void) {
     vPortDefineHeapRegions(xHeapRegions);
 }
 
+// ============================================================
+// FIFO POR FAMÍLIA (FR4)
+// ============================================================
+void fifoInsert(int id) {
+    int fam = g_inventory[id].family;
+    if (g_fifoCount[fam] >= MAX_COMPONENTS) return;
+    g_fifo[fam][g_fifoCount[fam]++] = id;
+}
+
+int fifoPop(int family) {
+    if (family < 1 || family > 3) return -1;
+    if (g_fifoCount[family] == 0) return -1;
+    int id = g_fifo[family][0];
+    for (int i = 0; i < g_fifoCount[family] - 1; i++)
+        g_fifo[family][i] = g_fifo[family][i + 1];
+    g_fifoCount[family]--;
+    return id;
+}
+
+// ============================================================
+// semiCalibration — FR2
+// ============================================================
+void semiCalibration() {
+    printf("[CALIB] A iniciar calibracao semi-automatica...\n");
+    gotoY(2);   // Y ao centro primeiro
+    gotoX(1);
+    gotoZ(1);
+    printf("[CALIB] Concluida: X=%d Y=%d Z=%d\n", getXPos(), getYPos(), getZPos());
+}
+
+// ============================================================
+// FUNÇÃO DE STOP DE EMERGÊNCIA (FR5)
+// ============================================================
+void triggerEmergencyStop(void) {
+    if (emergencyStop) return;
+    emergencyStop = true;
+
+    // 1. Corte físico imediato dos motores
+    stopX();
+    stopY();
+    stopZ();
+
+    // 2. Congelar tarefas de movimento
+    if (hTaskStore)      vTaskSuspend(hTaskStore);
+    if (hTaskDispense)   vTaskSuspend(hTaskDispense); // Incluído
+    if (hTaskGotoXZ)     vTaskSuspend(hTaskGotoXZ);
+    if (hTaskHorizontal) vTaskSuspend(hTaskHorizontal);
+    if (hTaskVertical)   vTaskSuspend(hTaskVertical);
+
+    // 3. Limpar contadores de pulsos
+    g_pulseUpper = 0;
+    g_pulseLower = 0;
+
+    printf("\n[EMERGENCY] STOP ATIVADO! Motores e tarefas congelados.\n");
+}
+
+// ============================================================
+// FUNÇÃO DE RESUME DE EMERGÊNCIA (FR6)
+// ============================================================
+void triggerResume(void) {
+    if (!emergencyStop) return;
+    emergencyStop = false;
+
+    g_pulseUpper = 0;
+    g_pulseLower = 0;
+
+    // Descongelar tarefas
+    if (hTaskVertical)   vTaskResume(hTaskVertical);
+    if (hTaskHorizontal) vTaskResume(hTaskHorizontal);
+    if (hTaskGotoXZ)     vTaskResume(hTaskGotoXZ);
+    if (hTaskDispense)   vTaskResume(hTaskDispense); // Incluído
+    if (hTaskStore)      vTaskResume(hTaskStore);
+
+    printf("\n[RESUME] Sistema retomado! A concluir a operacao anterior...\n");
+}
+//=============================================================
+// FUNÇÃO DE RESET DE EMERGÊNCIA (FR5)
+//=============================================================
+//=============================================================
+// FUNÇÃO DE RESET DE EMERGÊNCIA (FR5)
+//=============================================================
+void triggerReset(void) {
+    if (!emergencyStop) return;
+
+    printf("\n[RESET] A cancelar operacao e a reiniciar sistema...\n");
+
+    // 1. Limpar filas de pedidos e mensagens para cancelar o que estava pendente
+    if (xStoreQueue)    xQueueReset(xStoreQueue);
+    if (xDispenseQueue) xQueueReset(xDispenseQueue);
+    if (mbx_XZ)         xQueueReset(mbx_XZ);
+    if (xQueueX)        xQueueReset(xQueueX);
+    if (xQueueZ)        xQueueReset(xQueueZ);
+
+    // 2. Limpar contagens de pulsos
+    g_pulseUpper = 0;
+    g_pulseLower = 0;
+
+    // 3. Reverter qualquer peça que estivesse a meio do processo no inventário
+    for (int i = 1; i <= MAX_COMPONENTS; i++) {
+        if (g_inventory[i].inTransit) {
+            g_inventory[i].inTransit = false;
+            g_inventory[i].active = false;
+            g_inventory[i].cellX = 0;
+            g_inventory[i].cellZ = 0;
+            printf("[RESET] Peça ID=%d cancelada do transito.\n", i);
+        }
+    }
+
+    // 4. Descongelar as tarefas para voltarem ao ciclo de espera
+    if (hTaskVertical)   vTaskResume(hTaskVertical);
+    if (hTaskHorizontal) vTaskResume(hTaskHorizontal);
+    if (hTaskGotoXZ)     vTaskResume(hTaskGotoXZ);
+    if (hTaskDispense)   vTaskResume(hTaskDispense);
+    if (hTaskStore)      vTaskResume(hTaskStore);
+
+    // 5. Repor o sistema em modo normal
+    emergencyStop = false;
+    g_lightUpperMode = 0;
+    g_lightLowerMode = 0;
+
+    printf("[RESET] Sistema reiniciado e pronto para novos pedidos!\n");
+}
+
+// ============================================================
+// ISRs DOS BOTÕES
+// ============================================================
+void switch1_rising_isr(ULONGLONG lastTime) {
+    ULONGLONG time = GetTickCount64();
+    uInt8 p1 = readDigitalU8(1);
+    bool s2 = getBitValue(p1, 6) ? true : false;
+
+    // Se ambos estiverem premidos, é paragem de emergência
+    if (s2) {
+        triggerEmergencyStop();
+        return;
+    }
+
+    // Se o sistema estiver em STOP, o Switch 1 serve para dar RESUME (FR6)
+    if (emergencyStop) {
+        triggerResume();
+        return;
+    }
+
+    // Funcionamento Normal: contar pulsos para STORE (FR3)
+    g_pulseUpper++;
+    g_lastUpperTime = time;
+}
+
+void switch2_rising_isr(ULONGLONG lastTime) {
+    ULONGLONG time = GetTickCount64();
+    uInt8 p1 = readDigitalU8(1);
+    bool s1 = getBitValue(p1, 5) ? true : false;
+
+    // Se ambos estiverem premidos, é paragem de emergência
+    if (s1) {
+        triggerEmergencyStop();
+        return;
+    }
+
+    // Se estiver em STOP, Switch 2 executa o RESET (FR7)
+    if (emergencyStop) {
+        triggerReset();
+        return;
+    }
+
+    // Contar pulsos para DISPENSE (apenas fora de emergência)
+    g_pulseLower++;
+    g_lastLowerTime = time;
+}
+
+
+// ============================================================
+// TASK MENU
+// ============================================================
 void vTaskMenu(void* pvParameters) {
     int tecla = 0;
     while (tecla != 27) {
         if (_kbhit()) {
             tecla = _getch();
 
-            // --- Movimentos directos (Y e stop) continuam imediatos ---
             if (tecla == 's') { stopX(); stopY(); stopZ(); }
             if (tecla == 'q') { printf("Y dentro\n");  moveYInside(); }
             if (tecla == 'e') { printf("Y fora\n");    moveYOutside(); }
@@ -82,49 +360,52 @@ void vTaskMenu(void* pvParameters) {
             if (tecla == 'a') { printf("X esquerda\n"); moveXLeft(); }
             if (tecla == 'd') { printf("X direita\n"); moveXRight(); }
 
-            // --- Comandos gotoX: envia para a fila do X ---
-            //if (tecla == '1') { int v = 1; xQueueSend(xQueueX, &v, 0); printf("pedido X=1\n"); }
-            //if (tecla == '2') { int v = 2; xQueueSend(xQueueX, &v, 0); printf("pedido X=2\n"); }
-            //if (tecla == '3') { int v = 3; xQueueSend(xQueueX, &v, 0); printf("pedido X=3\n"); }
+            // if (tecla == '1') { int v = 1; xQueueSend(xQueueX, &v, 0); printf("pedido X=1\n"); }
+            // if (tecla == '2') { int v = 2; xQueueSend(xQueueX, &v, 0); printf("pedido X=2\n"); }
+            // if (tecla == '3') { int v = 3; xQueueSend(xQueueX, &v, 0); printf("pedido X=3\n"); }
 
-            // --- Comandos gotoZ: envia para a fila do Z ---
-            //if (tecla == '7') { int v = 1; xQueueSend(xQueueZ, &v, 0); printf("pedido Z=1\n"); }
-            //if (tecla == '8') { int v = 2; xQueueSend(xQueueZ, &v, 0); printf("pedido Z=2\n"); }
-            //if (tecla == '9') { int v = 3; xQueueSend(xQueueZ, &v, 0); printf("pedido Z=3\n"); }
-			// gotoXZ: envia para a fila do XZ (paralelo)
-            if (tecla == 'm') {
-                int x_target = _getch() - '0';
-                int z_target = _getch() - '0';
+            // if (tecla == '7') { int v = 1; xQueueSend(xQueueZ, &v, 0); printf("pedido Z=1\n"); }
+            // if (tecla == '8') { int v = 2; xQueueSend(xQueueZ, &v, 0); printf("pedido Z=2\n"); }
+            // if (tecla == '9') { int v = 3; xQueueSend(xQueueZ, &v, 0); printf("pedido Z=3\n"); }
 
-                if (x_target >= 1 && x_target <= 3 && z_target >= 1 && z_target <= 3) {
-                    printf("Deslocacao para X=%d, Z=%d\n", x_target, z_target);
-                    CellCoord coord = { x_target, z_target };
-                    xQueueSend(xQueueXZ, &coord, 0);
-                }
-                else {
-                    printf("Coordenadas invalidas!\n");
-                }
-            }
-
-            // --- GotoY (ainda directo, o Y não é paralelo) ---
             if (tecla == '4') { printf("gotoY(1)\n"); gotoY(1); }
             if (tecla == '5') { printf("gotoY(2)\n"); gotoY(2); }
             if (tecla == '6') { printf("gotoY(3)\n"); gotoY(3); }
 
-            // --- Complexos (mantêm-se directos por agora) ---
             if (tecla == 'u') { printf("gotoZUp\n");   gotoZUp(); }
             if (tecla == 'z') { printf("gotoZDown\n"); gotoZDown(); }
             if (tecla == 'p') { printf("putPartInCell\n");   putPartInCell(); }
             if (tecla == 't') { printf("takePartFromCell\n"); takePartFromCell(); }
 
-            // --- Testar luzes manualmente ---
-            if (tecla == 'l') {  // 'L' = cycle upper light
+            if (tecla == 'l') {
                 g_lightUpperMode = (g_lightUpperMode + 1) % 4;
                 printf("Luz upper mode = %d\n", g_lightUpperMode);
             }
-            if (tecla == 'k') {  // 'K' = cycle lower light
+            if (tecla == 'k') {
                 g_lightLowerMode = (g_lightLowerMode + 1) % 4;
                 printf("Luz lower mode = %d\n", g_lightLowerMode);
+            }
+            // --- Comando de teste: pedir (x,z) e enviar para a mediation task ---
+            if (tecla == 'g') {
+                printf("X (1-3): ");
+                int x = 0;
+                while (!_kbhit()) vTaskDelay(pdMS_TO_TICKS(20));
+                x = _getch() - '0';
+                printf("%d\n", x);
+
+                printf("Z (1-3): ");
+                int z = 0;
+                while (!_kbhit()) vTaskDelay(pdMS_TO_TICKS(20));
+                z = _getch() - '0';
+                printf("%d\n", z);
+
+                if (x >= 1 && x <= 3 && z >= 1 && z <= 3) {
+                    Coords c = { x, z };
+                    xQueueSend(mbx_XZ, &c, 0);
+                }
+                else {
+                    printf("Coordenadas invalidas\n");
+                }
             }
         }
         vTaskDelay(pdMS_TO_TICKS(20));
@@ -133,30 +414,21 @@ void vTaskMenu(void* pvParameters) {
     exit(0);
 }
 
-
-void vTaskHeartbeat(void* pvParameters) {
-    while (1) {
-        printf("[heartbeat]\n");
-        vTaskDelay(pdMS_TO_TICKS(2000));
-    }
-}
-
 // ============================================================
 // TASK HORIZONTAL — controla o eixo X
 // ============================================================
 void vTaskHorizontal(void* pvParameters) {
     int target;
     while (1) {
-        // Bloqueia até haver um pedido na fila
         if (xQueueReceive(xQueueX, &target, portMAX_DELAY) == pdTRUE) {
-            // NF5: só move X se Y estiver no centro (posição 2)
             if (getYPos() != 2) {
                 printf("[H] Y nao esta em 2, ignorado X=%d\n", target);
+                xSemaphoreGive(sem_X_finished);
                 continue;
             }
             printf("[H] gotoX(%d)\n", target);
             gotoX(target);
-			xSemaphoreGive(sem_X_finished); //X chegou ao destino, sinaliza que terminou
+            xSemaphoreGive(sem_X_finished);
         }
     }
 }
@@ -170,71 +442,250 @@ void vTaskVertical(void* pvParameters) {
         if (xQueueReceive(xQueueZ, &target, portMAX_DELAY) == pdTRUE) {
             if (getYPos() != 2) {
                 printf("[V] Y nao esta em 2, ignorado Z=%d\n", target);
+                xSemaphoreGive(sem_Z_finished);
                 continue;
             }
             printf("[V] gotoZ(%d)\n", target);
             gotoZ(target);
-			xSemaphoreGive(sem_Z_finished); //Z chegou ao destino, sinaliza que terminou
+            xSemaphoreGive(sem_Z_finished);
         }
     }
 }
 
 // ============================================================
-// TASK SIMULTÂNEA - controla X e Z em paralelo
+// TASK GOTO_XZ — mediation task
+// Recebe (x,z) por mailbox, despacha para xQueueX/xQueueZ em paralelo,
+// espera que ambos terminem.
 // ============================================================
+void goto_XZ_task(void* pvParameters) {
+    Coords c;
+    while (TRUE) {
+        if (xQueueReceive(mbx_XZ, &c, portMAX_DELAY) == pdTRUE) {
+            printf("[XZ] goto (%d,%d)\n", c.x, c.z);
 
-void vTaskGotoXZ(void* pvParameters) {
-    CellCoord target;
-    while (1) {
-        if (xQueueReceive(xQueueXZ, &target, portMAX_DELAY) == pdTRUE) {
-            xQueueSend(xQueueX, &target.x, portMAX_DELAY);
-            xQueueSend(xQueueZ, &target.z, portMAX_DELAY);
+            xSemaphoreTake(xXZBusyMutex, portMAX_DELAY);
+
+            xQueueSend(xQueueX, &c.x, portMAX_DELAY);
+            xQueueSend(xQueueZ, &c.z, portMAX_DELAY);
 
             xSemaphoreTake(sem_X_finished, portMAX_DELAY);
             xSemaphoreTake(sem_Z_finished, portMAX_DELAY);
+
+            printf("[XZ] done (%d,%d)\n", c.x, c.z);
+            xSemaphoreGive(xXZBusyMutex);
+            xSemaphoreGive(sem_XZ_finished);
         }
     }
 }
 
 // ============================================================
-// TASK BOTÕES — deteção de flanco + contagem de pulsos
+// TASK STORE — executa pedidos de armazenamento (FR3)
 // ============================================================
-void vTaskButtons(void* pvParameters) {
-    bool lastS1 = false;
-    bool lastS2 = false;
-
+void vTaskStore(void* pvParameters) {
+    Request req;
     while (1) {
-        uInt8 p1 = readDigitalU8(1);
-        bool s1 = getBitValue(p1, 5) ? true : false;   // switch upper
-        bool s2 = getBitValue(p1, 6) ? true : false;   // switch lower
+        if (xQueueReceive(xStoreQueue, &req, portMAX_DELAY) == pdTRUE) {
+            if (req.type != REQ_STORE) continue;
 
+            int id = req.value;
+
+            if (id < 1 || id > 9) {
+                printf("[STORE] ID invalido: %d\n", id);
+                continue;
+            }
+
+            xSemaphoreTake(xInventoryMutex, portMAX_DELAY);
+
+            if (g_inventory[id].active || g_inventory[id].inTransit) {
+                printf("[STORE] ID %d ja armazenado ou em transito. Rejeitado.\n", id);
+                xSemaphoreGive(xInventoryMutex);
+                continue;
+            }
+
+            int cellX, cellZ;
+            if (!findEmptyCell(&cellX, &cellZ)) {
+                printf("[STORE] Armazem cheio. Rejeitado.\n");
+                xSemaphoreGive(xInventoryMutex);
+                continue;
+            }
+
+            g_inventory[id].inTransit = true;
+            g_inventory[id].cellX = cellX;
+            g_inventory[id].cellZ = cellZ;
+            g_inventory[id].family = getFamily(id);
+            xSemaphoreGive(xInventoryMutex);
+
+            printf("[STORE] ID=%d Family=%d Cell=(%d,%d)\n",
+                id, getFamily(id), cellX, cellZ);
+
+            g_lightUpperMode = 2;
+
+            // Drenar qualquer sinal fantasma acumulado antes de ordenar a deslocação
+            while (xSemaphoreTake(sem_XZ_finished, 0) == pdTRUE);
+
+            Coords c = { cellX, cellZ };
+            xQueueSend(mbx_XZ, &c, portMAX_DELAY);
+            xSemaphoreTake(sem_XZ_finished, portMAX_DELAY);
+
+            putPartInCell();
+            gotoY(2); // Garante Y centrado antes de qualquer próximo ciclo
+
+            ULONGLONG now = GetTickCount64();
+            xSemaphoreTake(xInventoryMutex, portMAX_DELAY);
+            g_inventory[id].active = true;
+            g_inventory[id].inTransit = false;
+            g_inventory[id].storageTime = now;
+            fifoInsert(id); // Registo na fila FIFO da família
+            xSemaphoreGive(xInventoryMutex);
+
+            printf("[STORE] Concluido: ID=%d Time=%llu ms\n", id, now);
+
+            g_lightUpperMode = 0;
+        }
+    }
+}
+
+// ============================================================
+// TASK DISPENSE — executa pedidos de dispensação FIFO (FR4)
+// ============================================================
+void vTaskDispense(void* pvParameters) {
+    Request req;
+    while (1) {
+        if (xQueueReceive(xDispenseQueue, &req, portMAX_DELAY) == pdTRUE) {
+            int family = req.value;
+            if (family < 1 || family > 3) {
+                printf("[DISP] Familia invalida: %d\n", family);
+                continue;
+            }
+
+            xSemaphoreTake(xInventoryMutex, portMAX_DELAY);
+
+            int id = fifoPop(family);
+            if (id == -1) {
+                printf("[DISP] Familia %d sem stock (out of stock)\n", family);
+                xSemaphoreGive(xInventoryMutex);
+                continue;
+            }
+
+            g_inventory[id].inTransit = true;
+            int cellX = g_inventory[id].cellX;
+            int cellZ = g_inventory[id].cellZ;
+            ULONGLONG st = g_inventory[id].storageTime;
+
+            xSemaphoreGive(xInventoryMutex);
+
+            printf("[DISP] A retirar Familia=%d -> ID=%d da Celula=(%d,%d)\n",
+                family, id, cellX, cellZ);
+
+            g_lightLowerMode = 2; // FR9: Luz inferior pisca
+
+            // 1. Drenar qualquer sinal fantasma acumulado antes do envio
+            while (xSemaphoreTake(sem_XZ_finished, 0) == pdTRUE);
+
+            // 2. Vai buscar a peça à prateleira
+            Coords c1 = { cellX, cellZ };
+            xQueueSend(mbx_XZ, &c1, portMAX_DELAY);
+            xSemaphoreTake(sem_XZ_finished, portMAX_DELAY);
+
+            takePartFromCell();
+            gotoY(2); // Garante que o garfo recolhe na totalidade antes de viajar
+
+            // 3. Drenar novamente o semáforo antes da viagem para (1,1)
+            while (xSemaphoreTake(sem_XZ_finished, 0) == pdTRUE);
+
+            // 4. Transporta e entrega em (1,1)
+            Coords c2 = { 1, 1 };
+            xQueueSend(mbx_XZ, &c2, portMAX_DELAY);
+            xSemaphoreTake(sem_XZ_finished, portMAX_DELAY);
+
+            gotoY(2); // Garante Y centrado após a entrega na célula de saída
+
+            // 5. Atualizar inventário e libertar a célula antiga
+            ULONGLONG now = GetTickCount64();
+
+            xSemaphoreTake(xInventoryMutex, portMAX_DELAY);
+            g_inventory[id].active = false;
+            g_inventory[id].inTransit = false;
+            g_inventory[id].cellX = 0; // Desassocia formalmente a coordenada
+            g_inventory[id].cellZ = 0;
+
+            if (g_historyCount < 100) {
+                g_history[g_historyCount].id = id;
+                g_history[g_historyCount].family = family;
+                g_history[g_historyCount].dispenseTime = now;
+                g_history[g_historyCount].storageDuration = now - st;
+                g_historyCount++;
+            }
+            g_familyCount[family]++;
+            g_totalCount++;
+            xSemaphoreGive(xInventoryMutex);
+
+            printf("[DISP] Concluido: ID=%d entregue em (1,1). Duracao=%llu ms\n", id, now - st);
+
+            g_lightLowerMode = 0;
+        }
+    }
+}
+
+
+// ============================================================
+// TASK BUTTON REPORTER — timeout da sequência de pulsos
+// ============================================================
+void vTaskButtonReporter(void* pvParameters) {
+    while (1) {
         ULONGLONG now = GetTickCount64();
 
-        // ---- Flanco ascendente do switch 1 ----
-        if (s1 && !lastS1) {
-            g_pulseUpper++;
-            g_lastUpperTime = now;
-            printf("[BTN] S1 press #%d\n", g_pulseUpper);
-        }
-        // ---- Flanco ascendente do switch 2 ----
-        if (s2 && !lastS2) {
-            g_pulseLower++;
-            g_lastLowerTime = now;
-            printf("[BTN] S2 press #%d\n", g_pulseLower);
-        }
-
-        // ---- Deteção dos dois premidos ao mesmo tempo ----
+        uInt8 p1 = readDigitalU8(1);
+        bool s1 = getBitValue(p1, 5) ? true : false;
+        bool s2 = getBitValue(p1, 6) ? true : false;
         g_bothPressed = (s1 && s2);
 
-        lastS1 = s1;
-        lastS2 = s2;
+        if (g_bothPressed && !emergencyStop) {
+            triggerEmergencyStop();
+            g_pulseUpper = 0;
+            g_pulseLower = 0;
+        }
+
+        if (emergencyStop) {
+            vTaskDelay(pdMS_TO_TICKS(20));
+            continue;
+        }
+
+        // Processar Store -> xStoreQueue
+        if (g_pulseUpper > 0 && (now - g_lastUpperTime) > PULSE_TIMEOUT_MS) {
+            int id = g_pulseUpper;
+            g_pulseUpper = 0;
+
+            if (id >= 1 && id <= 9) {
+                Request r = { REQ_STORE, id };
+                xQueueSend(xStoreQueue, &r, 0);
+                printf("[BTN] Store request ID=%d enviado\n", id);
+            }
+            else {
+                printf("[BTN] ID invalido (%d) — ignorado\n", id);
+            }
+        }
+
+        // Processar Dispense -> xDispenseQueue
+        if (g_pulseLower > 0 && (now - g_lastLowerTime) > PULSE_TIMEOUT_MS) {
+            int fam = g_pulseLower;
+            g_pulseLower = 0;
+
+            if (fam >= 1 && fam <= 3) {
+                Request r = { REQ_DISPENSE, fam };
+                xQueueSend(xDispenseQueue, &r, 0);
+                printf("[BTN] Dispense request family=%d enviado\n", fam);
+            }
+            else {
+                printf("[BTN] Familia invalida (%d) — ignorado\n", fam);
+            }
+        }
 
         vTaskDelay(pdMS_TO_TICKS(20));
     }
 }
-
 // ============================================================
-// TASK LIGHTS — controla as duas luzes conforme os modos globais
+// TASK LIGHTS
 // ============================================================
 void vTaskLights(void* pvParameters) {
     bool upperOn = false;
@@ -245,16 +696,14 @@ void vTaskLights(void* pvParameters) {
         ULONGLONG now = GetTickCount64();
         ULONGLONG elapsed = now - lastToggle;
 
-        // Determinar se é altura de "tick" (inverter estado)
         bool tick = false;
-        ULONGLONG period = 1000; // por defeito, 1 segundo
+        ULONGLONG period = 1000;
 
-        // Se alguma luz está em modo rápido, o período é mais curto
         if (g_lightUpperMode == 3 || g_lightLowerMode == 3) {
-            period = 100;      // 100ms = 5 Hz
+            period = 100;
         }
         else if (g_lightUpperMode == 2 || g_lightLowerMode == 2) {
-            period = 400;      // 400ms = 1.25 Hz
+            period = 400;
         }
 
         if (elapsed >= period) {
@@ -262,15 +711,13 @@ void vTaskLights(void* pvParameters) {
             lastToggle = now;
         }
 
-        // ---- Atualizar upper ----
         switch (g_lightUpperMode) {
-        case 0: upperOn = false; break;                        // OFF
-        case 1: upperOn = true;  break;                        // ON
-        case 2:                                                // FLASH SLOW
-        case 3: if (tick) upperOn = !upperOn; break;           // FLASH
+        case 0: upperOn = false; break;
+        case 1: upperOn = true;  break;
+        case 2:
+        case 3: if (tick) upperOn = !upperOn; break;
         }
 
-        // ---- Atualizar lower ----
         switch (g_lightLowerMode) {
         case 0: lowerOn = false; break;
         case 1: lowerOn = true;  break;
@@ -278,7 +725,6 @@ void vTaskLights(void* pvParameters) {
         case 3: if (tick) lowerOn = !lowerOn; break;
         }
 
-        // ---- Escrever no port 2 ----
         uInt8 p = readDigitalU8(2);
         setBitValue(&p, 0, upperOn ? 1 : 0);
         setBitValue(&p, 1, lowerOn ? 1 : 0);
@@ -288,54 +734,72 @@ void vTaskLights(void* pvParameters) {
     }
 }
 
+// ============================================================
+// HOOK DE ARRANQUE
+// ============================================================
 void myDaemonTaskStartupHook(void) {
-    // INPUT PORTS
     createDigitalInput(0);
     createDigitalInput(1);
-    // OUTPUT PORTS
     createDigitalOutput(2);
 
     printf("\nCalibra o kit manualmente e prime ENTER...");
     while (true) {
-        if (_kbhit() && _getch() == 13) break; // 13 = Enter
+        if (_kbhit() && _getch() == 13) break;
     }
     printf("\nA iniciar tarefas...\n");
 
-    // Criar filas de pedidos de movimento
+    // Filas de movimento e pedidos
     xQueueX = xQueueCreate(5, sizeof(int));
     xQueueZ = xQueueCreate(5, sizeof(int));
-    xQueueXZ = xQueueCreate(5, sizeof(CellCoord));
-    // Criar mutex do port 2 (por agora não usado, mas fica pronto)
-    xPort2Mutex = xSemaphoreCreateMutex();
+    mbx_XZ = xQueueCreate(5, sizeof(Coords));
+    xStoreQueue = xQueueCreate(10, sizeof(Request));       // Fila Store
+    xDispenseQueue = xQueueCreate(10, sizeof(Request));    // Fila Dispense
+    xXZBusyMutex = xSemaphoreCreateMutex();
 
-    sem_X_finished = xSemaphoreCreateCounting(1, 0);
-    sem_Z_finished = xSemaphoreCreateCounting(1, 0);
+    // Semáforos de sincronização
+    sem_X_finished = xSemaphoreCreateCounting(10, 0);
+    sem_Z_finished = xSemaphoreCreateCounting(10, 0);
+    sem_XZ_finished = xSemaphoreCreateCounting(10, 0);
+    xInventoryMutex = xSemaphoreCreateMutex();
 
-    // Criar tarefas: nome, stack, param, prioridade, handle
+    // Inicializar inventário
+    for (int i = 0; i <= MAX_COMPONENTS; i++) {
+        g_inventory[i].id = i;
+        g_inventory[i].family = getFamily(i);
+        g_inventory[i].cellX = 0;
+        g_inventory[i].cellZ = 0;
+        g_inventory[i].active = false;
+        g_inventory[i].inTransit = false;
+        g_inventory[i].storageTime = 0;
+    }
+    printf("Inventario inicializado.\n");
+
+    // Criar tarefas (passando &hTaskDispense)
     xTaskCreate(vTaskMenu, "Menu", 1000, NULL, 2, NULL);
-    xTaskCreate(vTaskHorizontal, "Horizontal", 1000, NULL, 2, NULL);
-    xTaskCreate(vTaskVertical, "Vertical", 1000, NULL, 2, NULL);
-    xTaskCreate(vTaskGotoXZ, "GotoXZ", 1000, NULL, 2, NULL);
-    xTaskCreate(vTaskButtons, "Buttons", 1000, NULL, 2, NULL);
+    xTaskCreate(vTaskHorizontal, "Horizontal", 1000, NULL, 2, &hTaskHorizontal);
+    xTaskCreate(vTaskVertical, "Vertical", 1000, NULL, 2, &hTaskVertical);
+    xTaskCreate(vTaskButtonReporter, "BtnReporter", 1000, NULL, 2, NULL);
     xTaskCreate(vTaskLights, "Lights", 500, NULL, 1, NULL);
+    xTaskCreate(goto_XZ_task, "GOTO XZ Task", 1000, NULL, 3, &hTaskGotoXZ);
+    xTaskCreate(vTaskStore, "Store", 1000, NULL, 3, &hTaskStore);
+    xTaskCreate(vTaskDispense, "Dispense", 1000, NULL, 3, &hTaskDispense);
+
+    // Anexar ISRs aos pinos dos botões
+    attachInterrupt(1, 5, switch1_rising_isr, RISING);
+    attachInterrupt(1, 6, switch2_rising_isr, RISING);
+
+    semiCalibration();
+    printf("Sistema pronto. Aguardando comandos...\n");
 }
 
+// ============================================================
+// MAIN
+// ============================================================
 int main() {
     initialiseHeap();
     vApplicationDaemonTaskStartupHook = &myDaemonTaskStartupHook;
     vTaskStartScheduler();
 
-    // Nunca deve chegar aqui
     while (1);
     return 0;
 }
-// Run program: Ctrl + F5 or Debug > Start Without Debugging menu
-// Debug program: F5 or Debug > Start Debugging menu
-
-// Tips for Getting Started: 
-//   1. Use the Solution Explorer window to add/manage files
-//   2. Use the Team Explorer window to connect to source control
-//   3. Use the Output window to see build output and other messages
-//   4. Use the Error List window to view errors
-//   5. Go to Project > Add New Item to create new code files, or Project > Add Existing Item to add existing code files to the project
-//   6. In the future, to open this project again, go to File > Open > Project and select the .sln file
