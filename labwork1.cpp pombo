@@ -214,20 +214,23 @@ void triggerEmergencyStop(void) {
     stopY();
     stopZ();
 
-    // 2. Congelar tarefas de movimento
+    // 2. Congelar tarefas operacionais
     if (hTaskStore)      vTaskSuspend(hTaskStore);
-    if (hTaskDispense)   vTaskSuspend(hTaskDispense); // Incluído
+    if (hTaskDispense)   vTaskSuspend(hTaskDispense);
     if (hTaskGotoXZ)     vTaskSuspend(hTaskGotoXZ);
     if (hTaskHorizontal) vTaskSuspend(hTaskHorizontal);
     if (hTaskVertical)   vTaskSuspend(hTaskVertical);
 
-    // 3. Limpar contadores de pulsos
+    // 3. Limpar pulsos residuais
     g_pulseUpper = 0;
     g_pulseLower = 0;
 
-    printf("\n[EMERGENCY] STOP ATIVADO! Motores e tarefas congelados.\n");
-}
+    // 4. LUZES NO STOP: Ambas a piscar rápido (modo 3) para indicar EMERGÊNCIA
+    g_lightUpperMode = 3;
+    g_lightLowerMode = 3;
 
+    printf("\n[EMERGENCY] STOP ATIVADO! Luzes em alerta e motores parados.\n");
+}
 // ============================================================
 // FUNÇÃO DE RESUME DE EMERGÊNCIA (FR6)
 // ============================================================
@@ -238,14 +241,41 @@ void triggerResume(void) {
     g_pulseUpper = 0;
     g_pulseLower = 0;
 
-    // Descongelar tarefas
+    // 1. Restaurar a luz correta consoante a operação que estava em curso
+    bool inStore = false;
+    bool inDisp = false;
+
+    for (int i = 1; i <= MAX_COMPONENTS; i++) {
+        if (g_inventory[i].inTransit) {
+            // Se a peça tem célula atribuída mas ainda não está ativa -> estava em Store
+            if (!g_inventory[i].active) inStore = true;
+            // Se a peça estava ativa e passou a inTransit -> estava em Dispense
+            else inDisp = true;
+            break;
+        }
+    }
+
+    if (inStore) {
+        g_lightUpperMode = 2; // Volta a piscar a luz superior
+        g_lightLowerMode = 0;
+    }
+    else if (inDisp) {
+        g_lightUpperMode = 0;
+        g_lightLowerMode = 2; // Volta a piscar a luz inferior
+    }
+    else {
+        g_lightUpperMode = 0;
+        g_lightLowerMode = 0;
+    }
+
+    // 2. Descongelar as tarefas
     if (hTaskVertical)   vTaskResume(hTaskVertical);
     if (hTaskHorizontal) vTaskResume(hTaskHorizontal);
     if (hTaskGotoXZ)     vTaskResume(hTaskGotoXZ);
-    if (hTaskDispense)   vTaskResume(hTaskDispense); // Incluído
+    if (hTaskDispense)   vTaskResume(hTaskDispense);
     if (hTaskStore)      vTaskResume(hTaskStore);
 
-    printf("\n[RESUME] Sistema retomado! A concluir a operacao anterior...\n");
+    printf("\n[RESUME] Sistema retomado! A concluir a operacao pendente...\n");
 }
 //=============================================================
 // FUNÇÃO DE RESET DE EMERGÊNCIA (FR5)
