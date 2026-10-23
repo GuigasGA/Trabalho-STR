@@ -21,6 +21,9 @@ extern "C" {
 #define mainREGION_3_SIZE 7607
 #define PULSE_TIMEOUT_MS 800
 
+// Forward declarations
+void semiCalibration();
+
 // ============================================================
 // HANDLES GLOBAIS
 // ============================================================
@@ -70,11 +73,49 @@ typedef struct {
     int         value;   // ID para STORE, family para DISPENSE
 } Request;
 
-QueueHandle_t     xRequestQueue = NULL;
+QueueHandle_t xStoreQueue = NULL;
+QueueHandle_t xDispenseQueue = NULL;
 SemaphoreHandle_t sem_XZ_finished = NULL;
 SemaphoreHandle_t xInventoryMutex = NULL;
 SemaphoreHandle_t xXZBusyMutex = NULL;
 
+// ============================================================
+// FIFO POR FAMÍLIA E HISTÓRICO (FR4, FR14, FR15)
+// ============================================================
+int g_fifo[4][MAX_COMPONENTS];
+int g_fifoCount[4] = { 0 };
+
+typedef struct {
+    int       id;
+    int       family;
+    ULONGLONG dispenseTime;
+    ULONGLONG storageDuration;
+} DispenseRecord;
+
+DispenseRecord g_history[100];
+int g_historyCount = 0;
+
+int g_familyCount[4] = { 0 };
+int g_totalCount = 0;
+
+// ============================================================
+// FUNÇÕES FIFO
+// ============================================================
+void fifoInsert(int id) {
+    int fam = g_inventory[id].family;
+    if (g_fifoCount[fam] >= MAX_COMPONENTS) return;
+    g_fifo[fam][g_fifoCount[fam]++] = id;
+}
+
+int fifoPop(int family) {
+    if (family < 1 || family > 3) return -1;
+    if (g_fifoCount[family] == 0) return -1;
+    int id = g_fifo[family][0];
+    for (int i = 0; i < g_fifoCount[family] - 1; i++)
+        g_fifo[family][i] = g_fifo[family][i + 1];
+    g_fifoCount[family]--;
+    return id;
+}
 // ============================================================
 // FUNÇÕES AUXILIARES
 // ============================================================
@@ -251,6 +292,11 @@ void vTaskMenu(void* pvParameters) {
                 else {
                     printf("Coordenadas invalidas\n");
                 }
+             
+            }
+            if (tecla == 'c') {
+                printf("Calibracao semi-automatica pedida\n");
+                semiCalibration();
             }
         }
         vTaskDelay(pdMS_TO_TICKS(20));
@@ -324,13 +370,28 @@ void goto_XZ_task(void* pvParameters) {
 }
 
 // ============================================================
+// semiCalibration — FR2
+// Vai para a posição de origem (1,1) com Y centrado.
+// Reutilizável: chamar no arranque, no RESET, ou por tecla.
+// ============================================================
+void semiCalibration() {
+    printf("[CALIB] A iniciar calibracao semi-automatica...\n");
+
+    gotoY(2);   // Y ao centro PRIMEIRO (obrigatório antes de mover X/Z)
+    gotoX(1);   // X para 1
+    gotoZ(1);   // Z para 1
+
+    printf("[CALIB] Concluida: X=%d Y=%d Z=%d\n",
+        getXPos(), getYPos(), getZPos());
+}
+
+// ============================================================
 // TASK STORE — executa pedidos de armazenamento (FR3)
 // ============================================================
 void vTaskStore(void* pvParameters) {
     Request req;
     while (1) {
-        if (xQueueReceive(xRequestQueue, &req, portMAX_DELAY) == pdTRUE) {
-            if (req.type != REQ_STORE) continue;
+        if (xQueueReceive(xStoreQueue, &req, portMAX_DELAY) == pdTRUE) {
 
             int id = req.value;
 
@@ -382,11 +443,85 @@ void vTaskStore(void* pvParameters) {
             g_inventory[id].active = true;
             g_inventory[id].inTransit = false;
             g_inventory[id].storageTime = now;
+            fifoInsert(id);
             xSemaphoreGive(xInventoryMutex);
 
             printf("[STORE] Concluido: ID=%d Time=%llu ms\n", id, now);
 
             g_lightUpperMode = 0;
+        }
+    }
+}
+
+// ============================================================
+// TASK DISPENSE — executa pedidos de dispensação FIFO (FR4)
+// ============================================================
+void vTaskDispense(void* pvParameters) {
+    Request req;
+    while (1) {
+        if (xQueueReceive(xDispenseQueue, &req, portMAX_DELAY) == pdTRUE) {
+            
+
+            int family = req.value;
+            if (family < 1 || family > 3) {
+                printf("[DISP] Familia invalida: %d\n", family);
+                continue;
+            }
+
+            xSemaphoreTake(xInventoryMutex, portMAX_DELAY);
+
+            int id = fifoPop(family);
+            if (id == -1) {
+                printf("[DISP] Familia %d sem stock (out of stock)\n", family);
+                xSemaphoreGive(xInventoryMutex);
+                continue;   // não move
+            }
+
+            g_inventory[id].inTransit = true;
+            int cellX = g_inventory[id].cellX;
+            int cellZ = g_inventory[id].cellZ;
+            ULONGLONG st = g_inventory[id].storageTime;
+
+            xSemaphoreGive(xInventoryMutex);
+
+            printf("[DISP] Familia=%d -> ID=%d Cell=(%d,%d)\n",
+                family, id, cellX, cellZ);
+
+            g_lightLowerMode = 2;   // FR9
+
+            // Vai buscar à célula
+            Coords c1 = { cellX, cellZ };
+            xQueueSend(mbx_XZ, &c1, portMAX_DELAY);
+            xSemaphoreTake(sem_XZ_finished, portMAX_DELAY);
+            takePartFromCell();
+
+            // Entrega em (1,1)
+            Coords c2 = { 1, 1 };
+            xQueueSend(mbx_XZ, &c2, portMAX_DELAY);
+            xSemaphoreTake(sem_XZ_finished, portMAX_DELAY);
+            
+
+            // Registo
+            ULONGLONG now = GetTickCount64();
+
+            xSemaphoreTake(xInventoryMutex, portMAX_DELAY);
+            g_inventory[id].active = false;
+            g_inventory[id].inTransit = false;
+
+            if (g_historyCount < 100) {
+                g_history[g_historyCount].id = id;
+                g_history[g_historyCount].family = family;
+                g_history[g_historyCount].dispenseTime = now;
+                g_history[g_historyCount].storageDuration = now - st;
+                g_historyCount++;
+            }
+            g_familyCount[family]++;
+            g_totalCount++;
+            xSemaphoreGive(xInventoryMutex);
+
+            printf("[DISP] Concluido: ID=%d Duracao=%llu ms\n", id, now - st);
+
+            g_lightLowerMode = 0;
         }
     }
 }
@@ -404,7 +539,7 @@ void vTaskButtonReporter(void* pvParameters) {
 
             if (id >= 1 && id <= 9) {
                 Request r = { REQ_STORE, id };
-                xQueueSend(xRequestQueue, &r, 0);
+                xQueueSend(xStoreQueue, &r, 0);
                 printf("[BTN] Store request ID=%d enviado\n", id);
             }
             else {
@@ -415,8 +550,15 @@ void vTaskButtonReporter(void* pvParameters) {
         if (g_pulseLower > 0 && (now - g_lastLowerTime) > PULSE_TIMEOUT_MS) {
             int fam = g_pulseLower;
             g_pulseLower = 0;
-            // TODO (Fase 4.5): enviar REQ_DISPENSE(fam)
-            printf("[BTN] Lower sequence complete: family=%d\n", fam);
+
+            if (fam >= 1 && fam <= 3) {
+                Request r = { REQ_DISPENSE, fam };
+                xQueueSend(xDispenseQueue, &r, 0);
+                printf("[BTN] Dispense request family=%d enviado\n", fam);
+            }
+            else {
+                printf("[BTN] Familia invalida (%d) — ignorado\n", fam);
+            }
         }
 
         uInt8 p1 = readDigitalU8(1);
@@ -488,7 +630,8 @@ void myDaemonTaskStartupHook(void) {
 
     printf("\nCalibra o kit manualmente e prime ENTER...");
     while (true) {
-        if (_kbhit() && _getch() == 13) break;
+        if (_kbhit() && _getch() == 13)
+            break;
     }
     printf("\nA iniciar tarefas...\n");
 
@@ -496,7 +639,8 @@ void myDaemonTaskStartupHook(void) {
     xQueueX = xQueueCreate(5, sizeof(int));
     xQueueZ = xQueueCreate(5, sizeof(int));
     mbx_XZ = xQueueCreate(5, sizeof(Coords));
-    xRequestQueue = xQueueCreate(10, sizeof(Request));
+    xStoreQueue = xQueueCreate(10, sizeof(Request));
+    xDispenseQueue = xQueueCreate(10, sizeof(Request));
     xXZBusyMutex = xSemaphoreCreateMutex();
     
 
@@ -526,14 +670,19 @@ void myDaemonTaskStartupHook(void) {
     xTaskCreate(vTaskLights, "Lights", 500, NULL, 1, NULL);
     xTaskCreate(goto_XZ_task, "GOTO XZ Task", 1000, NULL, 3, NULL);
     xTaskCreate(vTaskStore, "Store", 1000, NULL, 3, NULL);
+    xTaskCreate(vTaskDispense, "Dispense", 1000, NULL, 3, NULL);
 
-    //xTaskCreate(vTaskEmergency, "Emergency", 500, NULL, 2, &emergencyTask);
-    //xTaskCreate(vTaskResume,    "Resume",    500, NULL, 2, &resumeTask);
-
+    xTaskCreate(vTaskEmergency, "Emergency", 500, NULL, 2, &emergencyTask);
+    xTaskCreate(vTaskResume,    "Resume",    500, NULL, 2, &resumeTask);
+    
     // Anexar ISRs aos pinos dos botões
     attachInterrupt(1, 5, switch1_rising_isr, RISING);
     attachInterrupt(1, 5, switch1_falling_isr, FALLING);
     attachInterrupt(1, 6, switch2_rising_isr, RISING);
+
+    // Calibração semi-automática no arranque
+    semiCalibration();
+    printf("Sistema pronto. Aguardando comandos...\n");
 }
 
 // ============================================================
