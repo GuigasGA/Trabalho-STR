@@ -56,18 +56,36 @@ void setPort2Bits(uInt8 mask, uInt8 value) {
 // Eixos — comandos de motor
 // ============================================================
 // X: bit6 = esquerda, bit7 = direita
-void moveXLeft() { setPort2Bits(0xC0, (uInt8)(1 << 6)); }
-void moveXRight() { setPort2Bits(0xC0, (uInt8)(1 << 7)); }
+void moveXLeft() {
+    if (getXPos() == 1) { stopX(); return; }   // limite esquerdo
+    setPort2Bits(0xC0, (uInt8)(1 << 6));
+}
+void moveXRight() {
+    if (getXPos() == 3) { stopX(); return; }   // limite direito
+    setPort2Bits(0xC0, (uInt8)(1 << 7));
+}
 void stopX() { setPort2Bits(0xC0, 0); }
 
 // Y: bit5 = para dentro, bit4 = para fora
-void moveYInside() { setPort2Bits(0x30, (uInt8)(1 << 5)); }
-void moveYOutside() { setPort2Bits(0x30, (uInt8)(1 << 4)); }
+void moveYInside() {
+    if (getYPos() == 3) { stopY(); return; }   // limite interior
+    setPort2Bits(0x30, (uInt8)(1 << 5));
+}
+void moveYOutside() {
+    if (getYPos() == 1) { stopY(); return; }   // limite exterior
+    setPort2Bits(0x30, (uInt8)(1 << 4));
+}
 void stopY() { setPort2Bits(0x30, 0); }
 
 // Z: bit3 = cima, bit2 = baixo
-void moveZUp() { setPort2Bits(0x0C, (uInt8)(1 << 3)); }
-void moveZDown() { setPort2Bits(0x0C, (uInt8)(1 << 2)); }
+void moveZUp() {
+    if (getZPos() == 6) { stopZ(); return; }   // limite superior
+    setPort2Bits(0x0C, (uInt8)(1 << 3));
+}
+void moveZDown() {
+    if (getZPos() == 1) { stopZ(); return; }   // limite inferior
+    setPort2Bits(0x0C, (uInt8)(1 << 2));
+}
 void stopZ() { setPort2Bits(0x0C, 0); }
 
 // ============================================================
@@ -112,6 +130,10 @@ typedef struct {
     void (*backward)();
     void (*stop)();
     int  homePos;
+    int  minPos;       // sensor do extremo "backward"
+    int  maxPos;       // sensor do extremo "forward"
+    uInt8 fwdMask;     // bit da porta 2 que move "forward"
+    uInt8 bwdMask;     // bit da porta 2 que move "backward"
 } Axis;
 
 static int rankLinear(int pos) {
@@ -126,9 +148,10 @@ static int rankZ(int pos) {
     return r[pos];
 }
 
-static const Axis AXIS_X = { "X", getXPos, rankLinear, moveXRight, moveXLeft,    stopX, 1 };
-static const Axis AXIS_Y = { "Y", getYPos, rankLinear, moveYInside, moveYOutside, stopY, 1 };
-static const Axis AXIS_Z = { "Z", getZPos, rankZ,      moveZUp,     moveZDown,    stopZ, 1 };
+//                          nome  getPos   rank        forward     backward      stop   home min max fwdMask bwdMask
+static const Axis AXIS_X = { "X", getXPos, rankLinear, moveXRight, moveXLeft,    stopX, 1,   1,  3,  0x80,   0x40 };
+static const Axis AXIS_Y = { "Y", getYPos, rankLinear, moveYInside, moveYOutside, stopY, 1,   1,  3,  0x20,   0x10 };
+static const Axis AXIS_Z = { "Z", getZPos, rankZ,      moveZUp,     moveZDown,    stopZ, 1,   1,  6,  0x08,   0x04 };
 
 static bool axisGoto(const Axis& a, int target) {
     // 1) posicao desconhecida: homing para a posicao de referencia
@@ -156,8 +179,16 @@ static bool axisGoto(const Axis& a, int target) {
     // 2) direcao decidida pela posicao FISICA (nao pelo numero do sensor)
     bool goForward = (rt > rc);
 
-    for (int n = 0; a.getPos() != target; n++) {
+    for (int n = 0; ; n++) {
+        int p = a.getPos();
+        if (p == target) break;
         if (resetInProgress) { a.stop(); return false; }
+        // Chegou a um extremo e o alvo nao e esse: nao continuar ate ao infinito
+        if ((goForward && p == a.maxPos) || (!goForward && p == a.minPos)) {
+            a.stop();
+            printf("[goto%s] LIMITE atingido (pos=%d), alvo=%d\n", a.name, p, target);
+            return false;
+        }
         if (n >= MOVE_TIMEOUT_ITER) {
             a.stop();
             printf("[goto%s] TIMEOUT\n", a.name);
@@ -168,6 +199,21 @@ static bool axisGoto(const Axis& a, int target) {
     }
     a.stop();
     return true;
+}
+
+// Chamada periodicamente por uma task: pára qualquer motor que esteja a empurrar
+// contra o extremo do eixo (cobre os movimentos manuais, que nao tem alvo).
+static void enforceAxis(const Axis& a, uInt8 port2) {
+    int pos = a.getPos();
+    if (pos == a.maxPos && (port2 & a.fwdMask)) a.stop();
+    if (pos == a.minPos && (port2 & a.bwdMask)) a.stop();
+}
+
+void enforceAxisLimits() {
+    uInt8 p = readDigitalU8(2);
+    enforceAxis(AXIS_X, p);
+    enforceAxis(AXIS_Y, p);
+    enforceAxis(AXIS_Z, p);
 }
 
 bool gotoX(int x) { if (x < 1 || x > 3) return false; return axisGoto(AXIS_X, x); }
