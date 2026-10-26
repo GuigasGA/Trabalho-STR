@@ -23,6 +23,9 @@ void initMotionLayer();
 // Escrita atomica de bits na porta 2: bits em 'mask' passam a ter o valor de 'value'
 void setPort2Bits(uInt8 mask, uInt8 value);
 
+// Pára qualquer eixo que esteja a empurrar contra o seu extremo (chamar periodicamente)
+void enforceAxisLimits();
+
 // X
 void moveXLeft();
 void moveXRight();
