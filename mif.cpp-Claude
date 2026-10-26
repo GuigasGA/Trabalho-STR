@@ -1,0 +1,208 @@
+#include "my_interaction_functions.h"
+
+extern "C" {
+#include <FreeRTOS.h>
+#include <task.h>
+#include <interface.h>
+#include <semphr.h>
+}
+
+extern volatile bool resetInProgress;
+
+// Timeouts em iteracoes (1 iteracao = vTaskDelay(1)).
+// Contar iteracoes em vez de tempo de relogio evita que o tempo passado
+// em STOP (task suspensa) conte para o timeout.
+#define MOVE_TIMEOUT_ITER   15000
+#define HOMING_TIMEOUT_ITER 5000
+
+// ============================================================
+// Bit manipulation
+// ============================================================
+int getBitValue(uInt8 value, uInt8 bit_n) {
+    return (value & (1 << bit_n));
+}
+
+void setBitValue(uInt8* variable, int n_bit, int new_value_bit) {
+    uInt8 mask_on = (uInt8)(1 << n_bit);
+    uInt8 mask_off = (uInt8)~mask_on;
+    if (new_value_bit) *variable |= mask_on;
+    else               *variable &= mask_off;
+}
+
+// ============================================================
+// Porta 2 (saidas) — acesso atomico
+// ============================================================
+static SemaphoreHandle_t xPort2Mutex = NULL;
+
+void initMotionLayer() {
+    if (xPort2Mutex == NULL)
+        xPort2Mutex = xSemaphoreCreateMutex();
+}
+
+void setPort2Bits(uInt8 mask, uInt8 value) {
+    // Timeout curto: se uma task suspensa ficou com o mutex, o STOP nao bloqueia.
+    bool got = false;
+    if (xPort2Mutex != NULL)
+        got = (xSemaphoreTake(xPort2Mutex, pdMS_TO_TICKS(50)) == pdTRUE);
+
+    uInt8 p = readDigitalU8(2);
+    p = (uInt8)((p & (uInt8)~mask) | (value & mask));
+    writeDigitalU8(2, p);
+
+    if (got) xSemaphoreGive(xPort2Mutex);
+}
+
+// ============================================================
+// Eixos — comandos de motor
+// ============================================================
+// X: bit6 = esquerda, bit7 = direita
+void moveXLeft() { setPort2Bits(0xC0, (uInt8)(1 << 6)); }
+void moveXRight() { setPort2Bits(0xC0, (uInt8)(1 << 7)); }
+void stopX() { setPort2Bits(0xC0, 0); }
+
+// Y: bit5 = para dentro, bit4 = para fora
+void moveYInside() { setPort2Bits(0x30, (uInt8)(1 << 5)); }
+void moveYOutside() { setPort2Bits(0x30, (uInt8)(1 << 4)); }
+void stopY() { setPort2Bits(0x30, 0); }
+
+// Z: bit3 = cima, bit2 = baixo
+void moveZUp() { setPort2Bits(0x0C, (uInt8)(1 << 3)); }
+void moveZDown() { setPort2Bits(0x0C, (uInt8)(1 << 2)); }
+void stopZ() { setPort2Bits(0x0C, 0); }
+
+// ============================================================
+// Eixos — sensores
+// ============================================================
+int getXPos() {
+    uInt8 p = readDigitalU8(0);
+    if (!getBitValue(p, 2)) return 1;
+    if (!getBitValue(p, 1)) return 2;
+    if (!getBitValue(p, 0)) return 3;
+    return -1;
+}
+
+int getYPos() {
+    uInt8 p = readDigitalU8(0);
+    if (!getBitValue(p, 5)) return 1;
+    if (!getBitValue(p, 4)) return 2;
+    if (!getBitValue(p, 3)) return 3;
+    return -1;
+}
+
+int getZPos() {
+    uInt8 p0 = readDigitalU8(0);
+    uInt8 p1 = readDigitalU8(1);
+    if (!getBitValue(p1, 3)) return 1;
+    if (!getBitValue(p1, 1)) return 2;
+    if (!getBitValue(p0, 7)) return 3;
+    if (!getBitValue(p1, 2)) return 4;
+    if (!getBitValue(p1, 0)) return 5;
+    if (!getBitValue(p0, 6)) return 6;
+    return -1;
+}
+
+// ============================================================
+// goto generico
+// ============================================================
+typedef struct {
+    const char* name;
+    int  (*getPos)();
+    int  (*rank)(int pos);   // posicao fisica ao longo do eixo (cresce no sentido "forward")
+    void (*forward)();
+    void (*backward)();
+    void (*stop)();
+    int  homePos;
+} Axis;
+
+static int rankLinear(int pos) {
+    return (pos >= 1 && pos <= 3) ? pos : -1;
+}
+
+// ORDEM FISICA DO Z (confirma no kit): 1 < 4 < 2 < 5 < 3 < 6
+// Se for diferente, so e preciso alterar esta tabela.
+static int rankZ(int pos) {
+    static const int r[7] = { -1, 0, 2, 4, 1, 3, 5 };
+    if (pos < 1 || pos > 6) return -1;
+    return r[pos];
+}
+
+static const Axis AXIS_X = { "X", getXPos, rankLinear, moveXRight, moveXLeft,    stopX, 1 };
+static const Axis AXIS_Y = { "Y", getYPos, rankLinear, moveYInside, moveYOutside, stopY, 1 };
+static const Axis AXIS_Z = { "Z", getZPos, rankZ,      moveZUp,     moveZDown,    stopZ, 1 };
+
+static bool axisGoto(const Axis& a, int target) {
+    // 1) posicao desconhecida: homing para a posicao de referencia
+    if (a.getPos() == -1) {
+        printf("[goto%s] posicao desconhecida, homing\n", a.name);
+        for (int n = 0; a.getPos() != a.homePos; n++) {
+            if (resetInProgress) { a.stop(); return false; }
+            if (n >= HOMING_TIMEOUT_ITER) {
+                a.stop();
+                printf("[goto%s] TIMEOUT no homing\n", a.name);
+                return false;
+            }
+            a.backward();
+            vTaskDelay(1);
+        }
+        a.stop();
+    }
+
+    int cur = a.getPos();
+    int rc = a.rank(cur);
+    int rt = a.rank(target);
+    if (rc < 0 || rt < 0) { a.stop(); return false; }
+    if (cur == target) { a.stop(); return true; }
+
+    // 2) direcao decidida pela posicao FISICA (nao pelo numero do sensor)
+    bool goForward = (rt > rc);
+
+    for (int n = 0; a.getPos() != target; n++) {
+        if (resetInProgress) { a.stop(); return false; }
+        if (n >= MOVE_TIMEOUT_ITER) {
+            a.stop();
+            printf("[goto%s] TIMEOUT\n", a.name);
+            return false;
+        }
+        if (goForward) a.forward(); else a.backward();
+        vTaskDelay(1);
+    }
+    a.stop();
+    return true;
+}
+
+bool gotoX(int x) { if (x < 1 || x > 3) return false; return axisGoto(AXIS_X, x); }
+bool gotoY(int y) { if (y < 1 || y > 3) return false; return axisGoto(AXIS_Y, y); }
+bool gotoZ(int z) { if (z < 1 || z > 3) return false; return axisGoto(AXIS_Z, z); }
+
+// Z: de uma posicao "em baixo" (1..3) para a "em cima" correspondente (4..6)
+bool gotoZUp() {
+    int pos = getZPos();
+    if (pos == -1) {
+        if (!axisGoto(AXIS_Z, 1)) return false;
+        pos = 1;
+    }
+    if (pos >= 4 && pos <= 6) return true;      // ja esta em cima
+    if (pos < 1 || pos > 3) return false;
+    return axisGoto(AXIS_Z, pos + 3);
+}
+
+bool gotoZDown() {
+    int pos = getZPos();
+    if (pos == -1) {
+        return axisGoto(AXIS_Z, 1);              // homing ja fica em baixo
+    }
+    if (pos >= 1 && pos <= 3) return true;      // ja esta em baixo
+    if (pos < 4 || pos > 6) return false;
+    return axisGoto(AXIS_Z, pos - 3);
+}
+
+// ============================================================
+// Sequencias compostas
+// ============================================================
+bool putPartInCell() {
+    return gotoZUp() && gotoY(3) && gotoZDown() && gotoY(2);
+}
+
+bool takePartFromCell() {
+    return gotoY(3) && gotoZUp() && gotoY(2) && gotoZDown();
+}
